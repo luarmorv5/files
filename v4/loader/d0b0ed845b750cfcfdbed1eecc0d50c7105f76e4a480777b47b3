@@ -1,1 +1,839 @@
+--[[
+    Aurora X  —  Kaitun Dungeon
+    Sam Premium logic + Aurora UI (logo, title, subtitle, floating minimize)
+]]
+
+local SUPPORTED_UNIVERSE_ID = 994732206
+if game.GameId ~= SUPPORTED_UNIVERSE_ID then
+    game:GetService("Players").LocalPlayer:Kick(
+        "This game is not supported. The script only works in Blox Fruits."
+    )
+    return
+end
+
+local cloneref = cloneref or function(o) return o end
+local function service(name) return cloneref(game:GetService(name)) end
+
+local Players             = service("Players")
+local CoreGui             = service("CoreGui")
+local UserInputService    = service("UserInputService")
+local TweenService        = service("TweenService")
+local Workspace           = service("Workspace")
+local ReplicatedStorage   = service("ReplicatedStorage")
+local VirtualInputManager = service("VirtualInputManager")
+
+local LocalPlayer = Players.LocalPlayer
+local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+
+----------------------------------------------------------------
+-- DUNGEON LOGIC (Sam)
+----------------------------------------------------------------
+local justDied = false
+local attackHeight = 40
+local selectedWeapon = "Sword"
+local weaponOptions = {"Sword", "Melee", "Blox Fruit"}
+local currentWeaponIndex = 1
+local autoDungeonActive = false
+local autoV4Active = false
+local currentTarget, lastTarget = nil, nil
+
+local netFolder = ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Net")
+local registerAttack = netFolder:WaitForChild("RE/RegisterAttack")
+local registerHit = netFolder:WaitForChild("RE/RegisterHit")
+local enemiesFolder = Workspace:FindFirstChild("Enemies") or Workspace
+local commF = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
+
+LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+    character = newCharacter
+    humanoidRootPart = newCharacter:WaitForChild("HumanoidRootPart")
+    justDied = true
+end)
+
+local function GetWeaponInBackpack(weaponName)
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if not backpack then return nil end
+    for _, tool in ipairs(backpack:GetChildren()) do
+        if string.find(string.lower(tool.Name), string.lower(weaponName)) or tool.ToolTip == weaponName then
+            return tool
+        end
+    end
+    return nil
+end
+
+local function EquipSelectedWeapon()
+    if not character or not autoDungeonActive then return end
+    local currentTool = character:FindFirstChildOfClass("Tool")
+    if currentTool and (string.find(string.lower(currentTool.Name), string.lower(selectedWeapon)) or currentTool.ToolTip == selectedWeapon) then
+        return
+    end
+    local toolToEquip = GetWeaponInBackpack(selectedWeapon)
+    if toolToEquip then
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if humanoid then humanoid:EquipTool(toolToEquip) end
+    end
+end
+
+local function ForceActivateHaki()
+    if not character or not autoDungeonActive then return end
+    if not character:FindFirstChild("HasBuso") then
+        pcall(function() commF:InvokeServer("Buso") end)
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if autoV4Active and autoDungeonActive and character then
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Y, false, game)
+                task.wait(0.1)
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Y, false, game)
+            end)
+        end
+    end
+end)
+
+local function StartAutoBuffs()
+    task.spawn(function()
+        while autoDungeonActive do
+            EquipSelectedWeapon()
+            task.wait(0.3)
+        end
+    end)
+    task.spawn(function()
+        while autoDungeonActive do
+            ForceActivateHaki()
+            task.wait(0.1)
+        end
+    end)
+end
+
+local function GetClosestEnemy()
+    if justDied then return nil end
+    local closestEnemy, shortestDistance = nil, math.huge
+    local currentCharacter = LocalPlayer.Character
+    if not currentCharacter or not currentCharacter:FindFirstChild("HumanoidRootPart") then return nil end
+    local myPos = currentCharacter.HumanoidRootPart.Position
+    local sourceFolder = Workspace:FindFirstChild("Enemies") or enemiesFolder
+    if not sourceFolder then return nil end
+
+    local jefeVivo = false
+    for _, obj in ipairs(sourceFolder:GetChildren()) do
+        local nameLower = string.lower(obj.Name)
+        if string.find(nameLower, "gas knight") or string.find(nameLower, "kitsune") then
+            local hum = obj:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                jefeVivo = true
+                break
+            end
+        end
+    end
+
+    local primaryCandidates, backupCandidates = {}, {}
+    for _, object in ipairs(sourceFolder:GetChildren()) do
+        if object.Name == "PropHitboxPlaceholder" and not jefeVivo then
+            -- skip
+        elseif object:IsA("Model") and object ~= currentCharacter
+            and object.Name ~= "Blank Buddy" and object.Name ~= "Sombra" and object.Name ~= "Shadow" then
+            local humanoid = object:FindFirstChildOfClass("Humanoid")
+            local root = object:FindFirstChild("HumanoidRootPart") or object:FindFirstChild("Head")
+            if humanoid and humanoid.Health > 0 and root and object.Parent then
+                local distance = (root.Position - myPos).Magnitude
+                local nameLower = string.lower(object.Name)
+                if string.find(nameLower, "gas knight") or string.find(nameLower, "kitsune") then
+                    distance = distance - 1000
+                end
+                if object ~= lastTarget then
+                    table.insert(primaryCandidates, {model = object, dist = distance})
+                else
+                    table.insert(backupCandidates, {model = object, dist = distance})
+                end
+            end
+        end
+    end
+
+    local targetList = #primaryCandidates > 0 and primaryCandidates or backupCandidates
+    for i = 1, #targetList do
+        if targetList[i].dist < shortestDistance then
+            shortestDistance = targetList[i].dist
+            closestEnemy = targetList[i].model
+        end
+    end
+    return closestEnemy
+end
+
+local function TeleportToEnemy(enemy)
+    if not enemy or not enemy.Parent or not humanoidRootPart then return false end
+    local enemyRoot = enemy:FindFirstChild("HumanoidRootPart") or enemy:FindFirstChild("Head")
+    if not enemyRoot then return false end
+    local success = pcall(function()
+        humanoidRootPart.CFrame = enemyRoot.CFrame * CFrame.new(0, attackHeight, 0)
+    end)
+    if not success then
+        local raycastParams = RaycastParams.new()
+        raycastParams.FilterDescendantsInstances = {character, enemy}
+        raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+        local raycastResult = Workspace:Raycast(enemyRoot.Position, Vector3.new(0, -100, 0), raycastParams)
+        if raycastResult then
+            humanoidRootPart.CFrame = CFrame.new(raycastResult.Position + Vector3.new(0, 3, 0))
+        end
+    end
+    return true
+end
+
+local function AttackEnemy(enemy)
+    if not enemy or not enemy.Parent then return end
+    local enemyHead = enemy:FindFirstChild("Head")
+    local enemyHumanoid = enemy:FindFirstChildOfClass("Humanoid")
+    if not enemyHead or not enemyHumanoid then return end
+    local tool = character and character:FindFirstChildOfClass("Tool")
+    if tool then tool:Activate() end
+    pcall(function()
+        registerAttack:FireServer(0)
+        registerHit:FireServer(enemyHead, {{enemy, enemyHead}})
+    end)
+end
+
+local function GetCurrentRoomIndex(rooms)
+    if not humanoidRootPart then return 1 end
+    local myPos = humanoidRootPart.Position
+    local currentRoomIdx, minDist = 1, math.huge
+    for i, room in ipairs(rooms) do
+        local roomPart = room:FindFirstChildOfClass("Part") or room:FindFirstChildOfClass("MeshPart") or room:FindFirstChild("Floor")
+        if roomPart then
+            local dist = (roomPart.Position - myPos).Magnitude
+            if dist < minDist then
+                minDist = dist
+                currentRoomIdx = i
+            end
+        end
+    end
+    return currentRoomIdx
+end
+
+local function AutoPassRoom()
+    local mapFolder = Workspace:FindFirstChild("Map")
+    if not mapFolder then return false end
+    local dungeonFolder = mapFolder:FindFirstChild("Dungeon")
+    if not dungeonFolder then return false end
+    local rooms = dungeonFolder:GetChildren()
+    if #rooms == 0 then return false end
+    table.sort(rooms, function(a, b)
+        return (tonumber(string.match(a.Name, "%d+")) or 0) < (tonumber(string.match(b.Name, "%d+")) or 0)
+    end)
+    local activeRoom = rooms[GetCurrentRoomIndex(rooms)]
+    if not activeRoom then return false end
+    local teleporter = activeRoom:FindFirstChild("ExitTeleporter")
+    if not teleporter then return false end
+    local rootPart = teleporter:FindFirstChild("Root")
+    if not (rootPart and rootPart:IsA("BasePart") and humanoidRootPart) then return false end
+    if not rootPart:FindFirstChildOfClass("TouchTransmitter") then return false end
+    humanoidRootPart.CFrame = rootPart.CFrame
+    task.wait(0.12)
+    if firetouchinterest then
+        firetouchinterest(humanoidRootPart, rootPart, 0)
+        task.wait(0.1)
+        firetouchinterest(humanoidRootPart, rootPart, 1)
+    end
+    if justDied then justDied = false end
+    return true
+end
+
+local function RotateTargets()
+    while autoDungeonActive do
+        currentTarget = GetClosestEnemy()
+        if currentTarget and not justDied then
+            lastTarget = currentTarget
+            local enemyHumanoid = currentTarget:FindFirstChildOfClass("Humanoid")
+            local timer = 0
+            while autoDungeonActive and currentTarget and currentTarget.Parent
+                and enemyHumanoid and enemyHumanoid.Health > 0 and timer < 0.3 and not justDied do
+                TeleportToEnemy(currentTarget)
+                AttackEnemy(currentTarget)
+                task.wait()
+                timer = timer + 0.01
+            end
+        else
+            if justDied then
+                local attempts = 0
+                while autoDungeonActive and justDied and attempts < 10 do
+                    if AutoPassRoom() then
+                        justDied = false
+                        break
+                    end
+                    attempts = attempts + 1
+                    task.wait(0.5)
+                end
+                if attempts >= 10 then justDied = false end
+            else
+                task.wait(1.0)
+                if not AutoPassRoom() then task.wait(0.5) end
+            end
+        end
+    end
+end
+
+----------------------------------------------------------------
+-- AURORA UI
+----------------------------------------------------------------
+local UI_NAME = "AuroraX_Dungeon"
+local FALLBACK_ICON = "rbxassetid://138635884129147"
+local RAW_LOGO_ID = "86231990490063" -- same as big farm script
+local VERSION = "v1.0"
+local MenuKey = Enum.KeyCode.RightShift
+local GLOW_IMAGE = "rbxassetid://5028857084"
+local ICON_MIN = "rbxassetid://118026365011536"
+local ICON_CLOSE = "rbxassetid://110786993356448"
+
+local function resolveAsset(input)
+    if not input or input == "" then return FALLBACK_ICON end
+    if type(input) == "string" and (input:match("^rbxthumb://") or input:match("^rbxasset://") or input:match("^rbxassetid://")) then
+        return input
+    end
+    local num = tostring(input):match("(%d+)")
+    if num then
+        local ok, objs = pcall(function() return game:GetObjects("rbxassetid://" .. num) end)
+        if ok and objs and objs[1] and objs[1]:IsA("Decal") and objs[1].Texture and objs[1].Texture ~= "" then
+            return objs[1].Texture
+        end
+        return "rbxthumb://type=Asset&id=" .. num .. "&w=420&h=420"
+    end
+    return tostring(input)
+end
+
+local LOGO_ID = resolveAsset(RAW_LOGO_ID)
+
+local THEME = {
+    Background   = Color3.fromRGB(12, 9, 11),
+    CardBg       = Color3.fromRGB(18, 13, 16),
+    ElementBg    = Color3.fromRGB(24, 17, 20),
+    Border       = Color3.fromRGB(36, 24, 28),
+    BorderActive = Color3.fromRGB(90, 36, 42),
+    Accent       = Color3.fromRGB(246, 92, 82),
+    AccentSoft   = Color3.fromRGB(255, 165, 155),
+    AccentDark   = Color3.fromRGB(130, 40, 42),
+    TextPrimary  = Color3.fromRGB(235, 235, 235),
+    TextMuted    = Color3.fromRGB(120, 110, 115),
+    OnGreen      = Color3.fromRGB(60, 180, 100),
+    OffRed       = Color3.fromRGB(180, 50, 55),
+}
+
+local TWEEN_FAST  = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local MIN_IN      = TweenInfo.new(0.34, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+local POP_OUT     = TweenInfo.new(0.42, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local POP_IN      = TweenInfo.new(0.20, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+local RESTORE_POS = TweenInfo.new(0.42, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local RESTORE_SCL = TweenInfo.new(0.46, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
+local function create(class, props)
+    local inst = Instance.new(class)
+    local parent
+    for k, v in pairs(props or {}) do
+        if k == "Parent" then parent = v else inst[k] = v end
+    end
+    if parent then inst.Parent = parent end
+    return inst
+end
+
+local function addCorner(p, r)
+    return create("UICorner", {CornerRadius = UDim.new(0, r or 6), Parent = p})
+end
+
+local function addStroke(p, color, thickness)
+    return create("UIStroke", {
+        Color = color, Thickness = thickness or 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = p,
+    })
+end
+
+local function tween(obj, info, props)
+    local t = TweenService:Create(obj, info, props)
+    t:Play()
+    return t
+end
+
+local function getHui()
+    local ok, h = pcall(function() return gethui and gethui() end)
+    if ok and h then return h end
+    return nil
+end
+
+do
+    local parents = {getHui(), CoreGui, LocalPlayer:FindFirstChildOfClass("PlayerGui")}
+    for _, p in ipairs(parents) do
+        if p then
+            pcall(function()
+                local old = p:FindFirstChild(UI_NAME)
+                if old then old:Destroy() end
+            end)
+        end
+    end
+end
+
+local ScreenGui = create("ScreenGui", {
+    Name = UI_NAME,
+    ResetOnSpawn = false,
+    IgnoreGuiInset = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    DisplayOrder = 999,
+})
+local parented = pcall(function() ScreenGui.Parent = getHui() or CoreGui end)
+if not parented or not ScreenGui.Parent then
+    ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local WIN_W, WIN_H = 300, 268
+local Main = create("Frame", {
+    Name = "Main",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0.5, 0, 0.5, -20),
+    Size = UDim2.fromOffset(WIN_W, WIN_H),
+    BackgroundTransparency = 1,
+    Parent = ScreenGui,
+})
+local MainScale = create("UIScale", {Scale = 1, Parent = Main})
+
+local Glow = create("ImageLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(-28, -28),
+    Size = UDim2.new(1, 56, 1, 56),
+    ZIndex = 0,
+    Image = GLOW_IMAGE,
+    ImageColor3 = THEME.AccentDark,
+    ImageTransparency = 0.82,
+    ScaleType = Enum.ScaleType.Slice,
+    SliceCenter = Rect.new(24, 24, 276, 276),
+    Parent = Main,
+})
+
+local Window = create("CanvasGroup", {
+    Name = "Window",
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = THEME.Background,
+    BorderSizePixel = 0,
+    Active = true,
+    ZIndex = 2,
+    Parent = Main,
+})
+addCorner(Window, 10)
+local OutlineStroke = addStroke(Window, THEME.Border, 1)
+
+-- Top bar
+local TopBar = create("Frame", {
+    Name = "TopBar",
+    Size = UDim2.new(1, 0, 0, 44),
+    BackgroundTransparency = 1,
+    Active = true,
+    Parent = Window,
+})
+create("Frame", {
+    Position = UDim2.new(0, 0, 0, 44),
+    Size = UDim2.new(1, 0, 0, 1),
+    BackgroundColor3 = THEME.Border,
+    BorderSizePixel = 0,
+    Parent = Window,
+})
+
+create("ImageLabel", {
+    Size = UDim2.fromOffset(40, 40),
+    Position = UDim2.fromOffset(2, 2),
+    BackgroundTransparency = 1,
+    Image = GLOW_IMAGE,
+    ImageColor3 = THEME.Accent,
+    ImageTransparency = 0.55,
+    Parent = TopBar,
+})
+
+create("ImageLabel", {
+    Size = UDim2.fromOffset(22, 22),
+    Position = UDim2.fromOffset(12, 11),
+    BackgroundTransparency = 1,
+    Image = LOGO_ID,
+    ScaleType = Enum.ScaleType.Fit,
+    Parent = TopBar,
+})
+
+local TitleLabel = create("TextLabel", {
+    BackgroundTransparency = 1,
+    Text = "Aurora X",
+    TextSize = 13,
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Position = UDim2.fromOffset(40, 7),
+    Size = UDim2.fromOffset(160, 14),
+    Parent = TopBar,
+})
+local TitleGrad = create("UIGradient", {Parent = TitleLabel})
+TitleGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, THEME.AccentSoft),
+    ColorSequenceKeypoint.new(0.5, THEME.Accent),
+    ColorSequenceKeypoint.new(1, THEME.AccentSoft),
+})
+
+create("TextLabel", {
+    BackgroundTransparency = 1,
+    Text = "Kaitun Dungeon  •  Premium",
+    TextSize = 8,
+    TextColor3 = THEME.TextMuted,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Position = UDim2.fromOffset(40, 23),
+    Size = UDim2.fromOffset(200, 12),
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    Parent = TopBar,
+})
+
+local function windowButton(iconId, xOffset, hoverColor)
+    local b = create("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, xOffset, 0.5, 0),
+        Size = UDim2.fromOffset(22, 22),
+        BackgroundColor3 = THEME.ElementBg,
+        BackgroundTransparency = 1,
+        Text = "",
+        AutoButtonColor = false,
+        Parent = TopBar,
+    })
+    addCorner(b, 6)
+    local ic = create("ImageLabel", {
+        Size = UDim2.fromOffset(12, 12),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        BackgroundTransparency = 1,
+        Image = iconId,
+        ImageColor3 = THEME.TextMuted,
+        ScaleType = Enum.ScaleType.Fit,
+        Parent = b,
+    })
+    b.MouseEnter:Connect(function()
+        tween(b, TWEEN_FAST, {BackgroundTransparency = 0})
+        tween(ic, TWEEN_FAST, {ImageColor3 = hoverColor or THEME.TextPrimary})
+    end)
+    b.MouseLeave:Connect(function()
+        tween(b, TWEEN_FAST, {BackgroundTransparency = 1})
+        tween(ic, TWEEN_FAST, {ImageColor3 = THEME.TextMuted})
+    end)
+    return b
+end
+
+local CloseBtn = windowButton(ICON_CLOSE, -8, Color3.fromRGB(255, 95, 95))
+local MinimizeBtn = windowButton(ICON_MIN, -34)
+
+-- Drag main window
+do
+    local dragging, dragStart, startPos = false, nil, nil
+    TopBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, input.Position, Main.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+-- Content
+local Content = create("Frame", {
+    Position = UDim2.fromOffset(12, 54),
+    Size = UDim2.new(1, -24, 1, -66),
+    BackgroundTransparency = 1,
+    Parent = Window,
+})
+create("UIListLayout", {
+    Padding = UDim.new(0, 8),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+    HorizontalAlignment = Enum.HorizontalAlignment.Center,
+    Parent = Content,
+})
+
+local function makeToggleBtn(text, order)
+    local btn = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 36),
+        BackgroundColor3 = THEME.OffRed,
+        Text = text,
+        TextColor3 = THEME.TextPrimary,
+        Font = Enum.Font.GothamSemibold,
+        TextSize = 13,
+        AutoButtonColor = false,
+        LayoutOrder = order,
+        Parent = Content,
+    })
+    addCorner(btn, 7)
+    addStroke(btn, THEME.Border, 1)
+    local sc = create("UIScale", {Parent = btn})
+    btn.MouseButton1Click:Connect(function()
+        sc.Scale = 0.96
+        tween(sc, TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1})
+    end)
+    return btn
+end
+
+local function makeRowBtn(text, order)
+    local btn = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 34),
+        BackgroundColor3 = THEME.ElementBg,
+        Text = text,
+        TextColor3 = THEME.TextPrimary,
+        Font = Enum.Font.GothamSemibold,
+        TextSize = 13,
+        AutoButtonColor = false,
+        LayoutOrder = order,
+        Parent = Content,
+    })
+    addCorner(btn, 7)
+    addStroke(btn, THEME.Border, 1)
+    return btn
+end
+
+-- Order: Auto Dungeon -> Auto V4 -> Weapon -> Height
+local btnAutoDungeon = makeToggleBtn("Start Auto Dungeon: OFF", 1)
+local btnAutoV4 = makeToggleBtn("Auto Activate V4: OFF", 2)
+local btnWeapon = makeRowBtn("Weapon: " .. weaponOptions[currentWeaponIndex], 3)
+
+local HeightFrame = create("Frame", {
+    Size = UDim2.new(1, 0, 0, 34),
+    BackgroundTransparency = 1,
+    LayoutOrder = 4,
+    Parent = Content,
+})
+
+local function smallBtn(parent, text, xScale, xOffset)
+    local b = create("TextButton", {
+        Size = UDim2.fromOffset(36, 34),
+        Position = UDim2.new(xScale, xOffset, 0, 0),
+        BackgroundColor3 = THEME.ElementBg,
+        Text = text,
+        TextColor3 = THEME.TextPrimary,
+        Font = Enum.Font.GothamBold,
+        TextSize = 16,
+        AutoButtonColor = false,
+        Parent = parent,
+    })
+    addCorner(b, 7)
+    addStroke(b, THEME.Border, 1)
+    return b
+end
+
+local btnMinus = smallBtn(HeightFrame, "-", 0, 0)
+local HeightDisplay = create("TextLabel", {
+    Size = UDim2.new(1, -80, 1, 0),
+    Position = UDim2.fromOffset(40, 0),
+    BackgroundColor3 = THEME.ElementBg,
+    Text = "Height: " .. attackHeight,
+    TextColor3 = THEME.TextPrimary,
+    Font = Enum.Font.GothamSemibold,
+    TextSize = 13,
+    Parent = HeightFrame,
+})
+addCorner(HeightDisplay, 7)
+addStroke(HeightDisplay, THEME.Border, 1)
+local btnPlus = smallBtn(HeightFrame, "+", 1, -36)
+
+-- Button logic
+btnAutoDungeon.MouseButton1Click:Connect(function()
+    autoDungeonActive = not autoDungeonActive
+    if autoDungeonActive then
+        btnAutoDungeon.Text = "Start Auto Dungeon: ON"
+        btnAutoDungeon.BackgroundColor3 = THEME.OnGreen
+        justDied = false
+        StartAutoBuffs()
+        task.spawn(RotateTargets)
+    else
+        btnAutoDungeon.Text = "Start Auto Dungeon: OFF"
+        btnAutoDungeon.BackgroundColor3 = THEME.OffRed
+        currentTarget, lastTarget, justDied = nil, nil, false
+    end
+end)
+
+btnAutoV4.MouseButton1Click:Connect(function()
+    autoV4Active = not autoV4Active
+    if autoV4Active then
+        btnAutoV4.Text = "Auto Activate V4: ON"
+        btnAutoV4.BackgroundColor3 = THEME.OnGreen
+    else
+        btnAutoV4.Text = "Auto Activate V4: OFF"
+        btnAutoV4.BackgroundColor3 = THEME.OffRed
+    end
+end)
+
+btnWeapon.MouseButton1Click:Connect(function()
+    currentWeaponIndex = currentWeaponIndex % #weaponOptions + 1
+    selectedWeapon = weaponOptions[currentWeaponIndex]
+    btnWeapon.Text = "Weapon: " .. selectedWeapon
+end)
+
+btnMinus.MouseButton1Click:Connect(function()
+    if attackHeight > 10 then attackHeight = attackHeight - 5 end
+    HeightDisplay.Text = "Height: " .. attackHeight
+end)
+
+btnPlus.MouseButton1Click:Connect(function()
+    if attackHeight < 100 then attackHeight = attackHeight + 5 end
+    HeightDisplay.Text = "Height: " .. attackHeight
+end)
+
+----------------------------------------------------------------
+-- FLOATING MINIMIZE (same style as big Aurora script)
+----------------------------------------------------------------
+local isMinimized, isAnimating = false, false
+local savedPosition = Main.Position
+
+local MiniHolder = create("Frame", {
+    Name = "AuroraToggle",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0, 36, 0.22, 0),
+    Size = UDim2.fromOffset(46, 46),
+    BackgroundTransparency = 1,
+    Visible = false,
+    ZIndex = 5,
+    Parent = ScreenGui,
+})
+local MiniScale = create("UIScale", {Scale = 0, Parent = MiniHolder})
+
+local MiniGlow = create("ImageLabel", {
+    Position = UDim2.fromOffset(-20, -20),
+    Size = UDim2.new(1, 40, 1, 40),
+    BackgroundTransparency = 1,
+    Image = GLOW_IMAGE,
+    ImageColor3 = THEME.Accent,
+    ImageTransparency = 0.5,
+    Parent = MiniHolder,
+})
+tween(MiniGlow, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {ImageTransparency = 0.82})
+
+local MiniButton = create("TextButton", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = THEME.CardBg,
+    Text = "",
+    AutoButtonColor = false,
+    ClipsDescendants = true,
+    Parent = MiniHolder,
+})
+addCorner(MiniButton, 12)
+addStroke(MiniButton, THEME.Border, 1)
+
+local MiniLogo = create("ImageLabel", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1,
+    Image = LOGO_ID,
+    ScaleType = Enum.ScaleType.Crop,
+    Parent = MiniButton,
+})
+addCorner(MiniLogo, 11)
+
+local function minimize()
+    if isMinimized or isAnimating then return end
+    isAnimating, isMinimized = true, true
+    savedPosition = Main.Position
+    local target = MiniHolder.Position
+    tween(Main, MIN_IN, {Position = target})
+    tween(MainScale, MIN_IN, {Scale = 0.05})
+    tween(Window, MIN_IN, {GroupTransparency = 1})
+    tween(Glow, MIN_IN, {ImageTransparency = 1})
+    tween(OutlineStroke, MIN_IN, {Transparency = 1})
+    task.delay(MIN_IN.Time, function()
+        if not ScreenGui.Parent then return end
+        Main.Visible = false
+        MiniHolder.Visible = true
+        MiniScale.Scale = 0
+        tween(MiniScale, POP_OUT, {Scale = 1})
+        task.delay(POP_OUT.Time, function() isAnimating = false end)
+    end)
+end
+
+local function restore()
+    if not isMinimized or isAnimating then return end
+    isAnimating = true
+    tween(MiniScale, POP_IN, {Scale = 0})
+    task.delay(POP_IN.Time, function()
+        if not ScreenGui.Parent then return end
+        MiniHolder.Visible = false
+        Main.Position = MiniHolder.Position
+        MainScale.Scale = 0.05
+        Main.Visible = true
+        tween(Main, RESTORE_POS, {Position = savedPosition})
+        tween(MainScale, RESTORE_SCL, {Scale = 1})
+        tween(Window, RESTORE_POS, {GroupTransparency = 0})
+        tween(Glow, RESTORE_POS, {ImageTransparency = 0.82})
+        tween(OutlineStroke, RESTORE_POS, {Transparency = 0})
+        task.delay(RESTORE_SCL.Time, function()
+            isAnimating, isMinimized = false, false
+        end)
+    end)
+end
+
+local function toggleMinimize()
+    if isMinimized then restore() else minimize() end
+end
+
+MinimizeBtn.MouseButton1Click:Connect(minimize)
+
+-- Drag + click floating toggle
+do
+    local pressing, moved, startInput, startPos = false, false, nil, nil
+    MiniButton.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            pressing, moved = true, false
+            startInput, startPos = input.Position, MiniHolder.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if pressing and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - startInput
+            if d.Magnitude > 4 then moved = true end
+            if moved then
+                MiniHolder.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if pressing and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            pressing = false
+            if not moved then restore() end
+        end
+    end)
+    MiniButton.MouseEnter:Connect(function()
+        if isMinimized and not isAnimating then tween(MiniScale, TWEEN_FAST, {Scale = 1.08}) end
+    end)
+    MiniButton.MouseLeave:Connect(function()
+        if isMinimized and not isAnimating then tween(MiniScale, TWEEN_FAST, {Scale = 1}) end
+    end)
+end
+
+-- Close
+CloseBtn.MouseButton1Click:Connect(function()
+    autoDungeonActive = false
+    autoV4Active = false
+    ScreenGui:Destroy()
+end)
+
+-- RightShift toggle
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == MenuKey then
+        toggleMinimize()
+    end
+end)
+
+-- Title shimmer
+task.spawn(function()
+    while ScreenGui.Parent do
+        TitleGrad.Offset = Vector2.new(math.sin(os.clock() * 1.6) * 0.55, 0)
+        task.wait(0.03)
+    end
+end)
+
+print("[Aurora X] Kaitun Dungeon loaded — RightShift to minimize")
 
